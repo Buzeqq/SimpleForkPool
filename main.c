@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <wait.h>
+#include <sys/ioctl.h>
 
 #define NO_OF_PROCESSES 7
 #define P_READ 0
@@ -11,16 +12,25 @@
 
 typedef struct fork_pool_t {
     pid_t child_processes[NO_OF_PROCESSES];
-    int *data;
-    size_t size_of_data;
+    int input[2];
+    int output[2];
 
     bool (*task)(int);
 } fork_pool_t;
 
+void initialise_fork_pool(fork_pool_t *fork_pool) {
+    if (pipe(fork_pool->input) != 0 || pipe(fork_pool->output) != 0) {
+        perror("Could not create pipes!\n");
+        exit(errno);
+    }
+    fork_pool->task = NULL;
+}
+
 void map(fork_pool_t *fork_pool, int *data, size_t data_size, bool (*task)(int)) {
-    fork_pool->data = data;
-    fork_pool->size_of_data = data_size;
     fork_pool->task = (bool (*)(int)) task;
+    for (int i = 0; i < data_size; i++) {
+        write(fork_pool->input[P_WRITE], &data[i], sizeof(data[i]));
+    }
 }
 
 bool is_prime(int n) {
@@ -36,81 +46,63 @@ bool is_prime(int n) {
 }
 
 void run(fork_pool_t* fork_pool) {
-    int input_pipes[2 * NO_OF_PROCESSES];
-    int output_pipe[2];
+    close(fork_pool->input[P_WRITE]);
 
-    for (int i = 0; i < NO_OF_PROCESSES; i++) {
-        if (pipe(&input_pipes[2 * i]) == -1) {
-            perror("Could not create pipe!");
-            exit(errno);
-        }
-    }
-    if (pipe(output_pipe) == -1) {
-        perror("Could not create pipe!");
-        exit(errno);
-    }
-
-    size_t bytes_written = 0;
     for (size_t i = 0; i < NO_OF_PROCESSES; i++) {
         pid_t *child = &fork_pool->child_processes[i];
 
         if ((*child = fork()) < 0) {
             perror("Failed to create child process!");
             exit(errno);
-        } else if (*child > 0) { // parent process
-            close(input_pipes[2 * i + P_READ]);// close input read end for parent process
-
-            // write
-            size_t data_offset = i * (fork_pool->size_of_data / NO_OF_PROCESSES);
-            size_t rest = 0;
-            if (i == NO_OF_PROCESSES - 1) {
-                rest = fork_pool->size_of_data % NO_OF_PROCESSES;
-            }
-            bytes_written += write(input_pipes[2 * i + P_WRITE],
-                                   fork_pool->data + data_offset,
-                                   (fork_pool->size_of_data / NO_OF_PROCESSES + rest) * sizeof(int));
-
-            close(input_pipes[2 * i + P_WRITE]); // close input write end for parent process
-        } else { // child process
+        } else if (*child == 0) { // child process
             printf("Process %d: running task!\n", getpid());
-            close(input_pipes[2 * i + P_WRITE]); // close input write end for child process
-            close(output_pipe[P_READ]); // close output read end for child process
+            int bytes_to_read = 0;
+            ioctl(fork_pool->input[P_READ], FIONREAD, &bytes_to_read);
+
             // run task
             int data = 0;
             int counter = 0;
-            while (read(input_pipes[2 * i + P_READ], &data, sizeof(data)) > 0) {
+            while (bytes_to_read > 0) {
+                read(fork_pool->input[P_READ], &data, sizeof(data));
                 if (fork_pool->task(data)) {
-                    write(output_pipe[P_WRITE], &data, sizeof(data));
+                    write(fork_pool->output[P_WRITE], &data, sizeof(data));
                 }
+                ioctl(fork_pool->input[P_READ], FIONREAD, &bytes_to_read);
                 counter++;
             }
+
+            close(fork_pool->input[P_READ]);
             printf("No more data to read, data read: %d, last read data: %d, pid: %d\n", counter, data, getpid());
-            close(input_pipes[2 * i + P_READ]); // close input read end for child process
-            close(output_pipe[P_WRITE]); // close output write end for child process
             exit(0);
         }
     }
-    printf("Bytes written: %zu\n", bytes_written);
-
+    // parent process
     // wait for child processes
     for (int i = 0; i < NO_OF_PROCESSES; i++) {
         waitpid(fork_pool->child_processes[i], NULL, 0);
     }
 
     printf("Parent process: %d waited for all the child process.\n", getpid());
-    for (int i = 0; i < NO_OF_PROCESSES; i++) {
-        close(output_pipe[P_WRITE]);
-        int data = 0;
-        while (read(output_pipe[P_READ], &data, sizeof(data)) > 0) {
-            printf("%d ", data);
-        }
-        close(output_pipe[P_READ]);
+    close(fork_pool->output[P_WRITE]);
+    int bytes_to_read;
+
+    ioctl(fork_pool->output[P_READ], FIONREAD, &bytes_to_read);
+    int data;
+    int counter = 0;
+    while (bytes_to_read > 0) {
+        read(fork_pool->output[P_READ], &data, sizeof(data));
+        printf("%d ", data);
+        ioctl(fork_pool->output[P_READ], FIONREAD, &bytes_to_read);
+        counter++;
     }
+    printf("\nTotal of prime numbers: %d\n", counter);
+    close(fork_pool->output[P_READ]);
 }
 
 int main() {
     fork_pool_t fork_pool;
 
+    initialise_fork_pool(&fork_pool);
     printf("Enter the range: ");
     int min = 0, max = 0;
     scanf("%d %d", &min, &max);
